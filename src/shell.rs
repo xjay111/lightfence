@@ -211,6 +211,16 @@ pub fn background_menu(owner: HWND, pt: POINT, top: impl FnOnce(HMENU), bottom: 
     }
 }
 
+/// Explorer's drop target for the user's desktop folder: dropping on it copies or
+/// moves files (and virtual files, such as images dragged out of a browser) into it.
+pub fn desktop_drop_target() -> Option<IDropTarget> {
+    let dir = crate::desktop::user_folder()?;
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(dir), None).ok()?;
+        item.BindToHandler(None, &BHID_SFUIObject).ok()
+    }
+}
+
 /// Files on the clipboard that "粘贴" could put on the desktop.
 pub fn can_paste() -> bool {
     unsafe { windows::Win32::System::DataExchange::IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() }

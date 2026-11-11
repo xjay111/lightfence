@@ -41,9 +41,10 @@ thread_local! {
     static FENCES: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
     static HIDE_ICONS: Cell<bool> = const { Cell::new(true) };
     static SETTINGS: RefCell<Settings> = RefCell::new(Settings::default());
-    /// After "新建"/"粘贴" on the desktop: where the user clicked, whether to start
-    /// renaming, and when; the next new desktop items land there.
-    static EXPECT_NEW: Cell<Option<(POINT, bool, std::time::Instant)>> = const { Cell::new(None) };
+    /// Where the next new desktop items should go (after "新建", "粘贴" or a drop).
+    static EXPECT_NEW: Cell<Option<Expect>> = const { Cell::new(None) };
+    /// Desktop items as of the last sync, to tell which ones are new.
+    static KNOWN: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
     /// The desktop layer (catch-all fence), if icons are hidden.
     static LAYER: Cell<HWND> = Cell::new(HWND::default());
     static WATCH_ID: Cell<u32> = const { Cell::new(0) };
@@ -146,10 +147,20 @@ pub fn save() {
     config::save(&config::Config { fences, settings: settings(), hide_desktop_icons: HIDE_ICONS.get() });
 }
 
-/// The next items that appear on the desktop (within a few seconds) go to `pt`,
-/// and the first is renamed if `rename`.
-pub fn expect_new_items(pt: POINT, rename: bool) {
-    EXPECT_NEW.set(Some((pt, rename, std::time::Instant::now())));
+#[derive(Clone, Copy)]
+struct Expect {
+    /// Fence to put them in; `None` means the desktop layer.
+    target: Option<HWND>,
+    pt: POINT,
+    rename: bool,
+    at: std::time::Instant,
+}
+
+/// Items that appear on the desktop in the next few seconds go into `target` at
+/// screen point `pt` (the desktop layer if `None`); with `rename`, the first one
+/// starts in rename mode.
+pub fn expect_new_items(target: Option<HWND>, pt: POINT, rename: bool) {
+    EXPECT_NEW.set(Some(Expect { target, pt, rename, at: std::time::Instant::now() }));
 }
 
 pub fn settings() -> Settings {
@@ -224,6 +235,11 @@ fn apply_hide_icons() {
 pub fn sync_desktop() {
     let present = desktop::items();
     let on_desktop: HashSet<String> = present.iter().map(|p| p.to_lowercase()).collect();
+    let fresh: Vec<String> = KNOWN.with_borrow(|known| match known {
+        Some(k) => present.iter().filter(|p| !k.contains(&p.to_lowercase())).cloned().collect(),
+        None => Vec::new(),
+    });
+    KNOWN.set(Some(on_desktop.clone()));
     let fences = FENCES.with_borrow(|v| v.clone());
     let catch_all = find_catch_all();
     let mut claimed = HashSet::new();
@@ -238,21 +254,25 @@ pub fn sync_desktop() {
     if let Some(h) = catch_all {
         let loose: Vec<String> = present.into_iter().filter(|p| !claimed.contains(&p.to_lowercase())).collect();
         let loose_set: HashSet<String> = loose.iter().map(|p| p.to_lowercase()).collect();
-        let known: HashSet<String> = fence::with(h, |f| f.cfg.all_items().map(|p| p.to_lowercase()).collect()).unwrap_or_default();
-        let fresh: Vec<String> = loose.iter().filter(|p| !known.contains(&p.to_lowercase())).cloned().collect();
         fence::with(h, |f| {
             f.retain_items(|p| loose_set.contains(&p.to_lowercase()));
             f.append_items(&loose);
         });
-        if let Some((pt, rename, at)) = EXPECT_NEW.get() {
-            if at.elapsed().as_secs() > 10 {
-                EXPECT_NEW.set(None);
-            } else if !fresh.is_empty() {
-                EXPECT_NEW.set(None);
-                fence::with(h, |f| f.accept_drop(&fresh, pt));
-                if rename {
-                    fence::rename_path(h, &fresh[0]);
+    }
+    if let Some(e) = EXPECT_NEW.get() {
+        if e.at.elapsed().as_secs() > 15 {
+            EXPECT_NEW.set(None);
+        } else if !fresh.is_empty() {
+            let alive = |h: &HWND| FENCES.with_borrow(|v| v.contains(h));
+            if let Some(target) = e.target.filter(alive).or(catch_all) {
+                add_items(target, fresh.clone(), e.pt);
+                if e.rename {
+                    fence::rename_path(target, &fresh[0]);
                 }
+            }
+            // "新建" makes one item; a copy may arrive in several batches, so keep waiting.
+            if e.rename {
+                EXPECT_NEW.set(None);
             }
         }
     }

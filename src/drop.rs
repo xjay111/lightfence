@@ -1,6 +1,13 @@
-//! Accepting desktop items dragged onto a fence, from the desktop or another fence.
+//! Drops onto a fence or the desktop layer.
+//!
+//! Desktop items (from the desktop, Explorer's desktop folder, or another fence)
+//! are only re-filed: we record them here and never touch the files. Anything
+//! else — files from WeChat, QQ, other folders, images from a browser — goes to
+//! the desktop folder's own shell drop target, which copies or moves it exactly
+//! like a drop on Explorer's desktop; the new items are then placed where the
+//! user let go.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use windows::core::w;
 use windows::Win32::Foundation::{GlobalFree, HWND, POINT, POINTL};
@@ -12,27 +19,91 @@ use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::*;
 use windows_core::{implement, Ref, Result};
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Reject,
+    /// Desktop items: re-file them, leave the files alone.
+    Refile,
+    /// Anything else: let the shell put it on the desktop.
+    Import,
+}
+
 #[implement(IDropTarget)]
 pub struct DropTarget {
     hwnd: HWND,
-    accept: Cell<bool>,
-    /// Draws the shell drag image (and our "移动到 …" caption) over the fence.
+    mode: Cell<Mode>,
+    /// Draws the shell drag image (and our caption) over the fence.
     helper: Option<IDropTargetHelper>,
+    /// The desktop folder's drop target while importing.
+    shell: RefCell<Option<IDropTarget>>,
+    data: RefCell<Option<IDataObject>>,
+    /// Effect the caption was last set for, to avoid rewriting it on every move.
+    shown: Cell<DROPEFFECT>,
 }
 
 impl DropTarget {
     pub fn new(hwnd: HWND) -> IDropTarget {
         let helper = unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.ok();
-        Self { hwnd, accept: Cell::new(false), helper }.into()
+        Self {
+            hwnd,
+            mode: Cell::new(Mode::Reject),
+            helper,
+            shell: RefCell::new(None),
+            data: RefCell::new(None),
+            shown: Cell::new(DROPEFFECT(u32::MAX)),
+        }
+        .into()
     }
 
-    fn effect(&self) -> DROPEFFECT {
-        // COPY, never MOVE: the source must not delete anything. We only record paths.
-        if self.accept.get() {
-            DROPEFFECT_COPY
-        } else {
-            DROPEFFECT_NONE
+    /// Asks the shell (when importing) what a drop here would do; `allowed` is
+    /// what the source offers. Re-filing is always a COPY so the source never
+    /// deletes anything.
+    unsafe fn effect(&self, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, allowed: DROPEFFECT) -> DROPEFFECT {
+        match self.mode.get() {
+            Mode::Reject => DROPEFFECT_NONE,
+            Mode::Refile => DROPEFFECT_COPY,
+            Mode::Import => {
+                let mut effect = allowed;
+                match self.shell.borrow().as_ref() {
+                    Some(t) if t.DragOver(keys, *pt, &mut effect).is_ok() => effect,
+                    _ => DROPEFFECT_NONE,
+                }
+            }
         }
+    }
+
+    /// Caption under the drag image: "移动到 / 复制到 <fence>".
+    fn describe(&self, effect: DROPEFFECT) {
+        if effect == self.shown.get() {
+            return;
+        }
+        self.shown.set(effect);
+        let Some(data) = self.data.borrow().clone() else { return };
+        let name = crate::fence::with(self.hwnd, |f| f.cfg.tab().name.clone()).unwrap_or_default();
+        let (kind, msg) = if self.mode.get() == Mode::Refile || effect.0 & DROPEFFECT_MOVE.0 != 0 {
+            (DROPIMAGE_MOVE, "移动到 %1")
+        } else if effect.0 & DROPEFFECT_COPY.0 != 0 {
+            (DROPIMAGE_COPY, "复制到 %1")
+        } else if effect.0 & DROPEFFECT_LINK.0 != 0 {
+            (DROPIMAGE_LINK, "在 %1 创建快捷方式")
+        } else {
+            (DROPIMAGE_INVALID, "")
+        };
+        set_description(&data, kind, msg, &name);
+    }
+
+    fn reset(&self) {
+        crate::fence::drag_over(self.hwnd, None);
+        if let Some(t) = self.shell.take() {
+            unsafe {
+                let _ = t.DragLeave();
+            }
+        }
+        if let Some(d) = self.data.take() {
+            set_description(&d, DROPIMAGE_INVALID, "", "");
+        }
+        self.mode.set(Mode::Reject);
+        self.shown.set(DROPEFFECT(u32::MAX));
     }
 }
 
@@ -41,39 +112,57 @@ fn point(pt: &POINTL) -> POINT {
 }
 
 impl IDropTarget_Impl for DropTarget_Impl {
-    fn DragEnter(&self, data: Ref<IDataObject>, _: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+    fn DragEnter(&self, data: Ref<IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
         let data = data.as_ref();
-        let ok = data.is_some_and(|d| !desktop_paths(d).is_empty());
-        self.accept.set(ok);
-        if let (true, Some(d)) = (ok, data) {
-            let title = crate::fence::with(self.hwnd, |f| f.cfg.tab().name.clone()).unwrap_or_default();
-            set_description(d, DROPIMAGE_MOVE, "移动到 %1", &title);
+        let allowed = unsafe { *effect };
+        let mut mode = Mode::Reject;
+        if let Some(d) = data {
+            let paths = dropped_paths(d);
+            if !paths.is_empty() && paths.iter().all(|p| crate::desktop::is_desktop_item(p)) {
+                mode = Mode::Refile;
+            } else if let Some(t) = crate::shell::desktop_drop_target() {
+                let mut e = allowed;
+                if unsafe { t.DragEnter(d, keys, *pt, &mut e) }.is_ok() && e != DROPEFFECT_NONE {
+                    *self.shell.borrow_mut() = Some(t);
+                    mode = Mode::Import;
+                } else {
+                    unsafe {
+                        let _ = t.DragLeave();
+                    }
+                }
+            }
         }
-        crate::fence::drag_over(self.hwnd, ok.then(|| point(pt)));
+        self.mode.set(mode);
+        *self.data.borrow_mut() = data.cloned();
+        let e = unsafe { self.effect(keys, pt, allowed) };
+        self.describe(e);
+        crate::fence::drag_over(self.hwnd, (mode != Mode::Reject).then(|| point(pt)));
         unsafe {
-            *effect = self.effect();
+            *effect = e;
             if let (Some(h), Some(d)) = (&self.helper, data) {
-                let _ = h.DragEnter(self.hwnd, d, &point(pt), *effect);
+                let _ = h.DragEnter(self.hwnd, d, &point(pt), e);
             }
         }
         Ok(())
     }
 
-    fn DragOver(&self, _: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        if self.accept.get() {
+    fn DragOver(&self, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+        let e = unsafe { self.effect(keys, pt, *effect) };
+        if self.mode.get() != Mode::Reject {
+            self.describe(e);
             crate::fence::drag_over(self.hwnd, Some(point(pt)));
         }
         unsafe {
-            *effect = self.effect();
+            *effect = e;
             if let Some(h) = &self.helper {
-                let _ = h.DragOver(&point(pt), *effect);
+                let _ = h.DragOver(&point(pt), e);
             }
         }
         Ok(())
     }
 
     fn DragLeave(&self) -> Result<()> {
-        crate::fence::drag_over(self.hwnd, None);
+        self.reset();
         if let Some(h) = &self.helper {
             unsafe {
                 let _ = h.DragLeave();
@@ -82,29 +171,43 @@ impl IDropTarget_Impl for DropTarget_Impl {
         Ok(())
     }
 
-    fn Drop(&self, data: Ref<IDataObject>, _: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        crate::fence::drag_over(self.hwnd, None);
+    fn Drop(&self, data: Ref<IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
         let data = data.as_ref();
-        let paths = data.map(desktop_paths).unwrap_or_default();
-        self.accept.set(!paths.is_empty());
+        let allowed = unsafe { *effect };
+        let mut result = DROPEFFECT_NONE;
+        match (self.mode.get(), data) {
+            (Mode::Refile, Some(d)) => {
+                let paths: Vec<String> = dropped_paths(d).into_iter().filter(|p| crate::desktop::is_desktop_item(p)).collect();
+                if !paths.is_empty() {
+                    result = DROPEFFECT_COPY;
+                    crate::add_items(self.hwnd, paths, point(pt));
+                }
+            }
+            (Mode::Import, Some(d)) => {
+                if let Some(t) = self.shell.take() {
+                    // The new desktop items show up through the desktop watcher; put them here.
+                    crate::expect_new_items(Some(self.hwnd), point(pt), false);
+                    let mut e = allowed;
+                    if unsafe { t.Drop(d, keys, *pt, &mut e) }.is_ok() {
+                        result = e;
+                    }
+                }
+            }
+            _ => {}
+        }
         unsafe {
-            *effect = self.effect();
+            *effect = result;
             if let (Some(h), Some(d)) = (&self.helper, data) {
-                let _ = h.Drop(d, &point(pt), *effect);
+                let _ = h.Drop(d, &point(pt), result);
             }
         }
-        if let Some(d) = data {
-            set_description(d, DROPIMAGE_INVALID, "", "");
-        }
-        if !paths.is_empty() {
-            crate::add_items(self.hwnd, paths, point(pt));
-        }
+        self.reset();
         Ok(())
     }
 }
 
-/// Dropped file paths that live directly on the desktop.
-fn desktop_paths(data: &IDataObject) -> Vec<String> {
+/// File paths in the dragged data (the grabbed item first when it comes from a fence).
+fn dropped_paths(data: &IDataObject) -> Vec<String> {
     if let Some(paths) = crate::shell::dragging() {
         return paths;
     }
@@ -127,7 +230,6 @@ fn desktop_paths(data: &IDataObject) -> Vec<String> {
         }
         ReleaseStgMedium(&mut medium);
     }
-    paths.retain(|p| crate::desktop::is_desktop_item(p));
     paths
 }
 

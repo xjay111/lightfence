@@ -536,7 +536,7 @@ unsafe fn desktop_menu(hwnd: HWND, p: POINT) {
     match choice {
         BgChoice::Ours(BG_REFRESH) => crate::sync_desktop(),
         BgChoice::Ours(BG_PASTE) | BgChoice::Ours(BG_PASTE_LINK) => {
-            crate::expect_new_items(p, false);
+            crate::expect_new_items(None, p, false);
             crate::shell::paste_to_desktop(crate::host(), matches!(choice, BgChoice::Ours(BG_PASTE_LINK)));
         }
         BgChoice::Ours(BG_NEW_FENCE) => crate::new_fence_at(p),
@@ -548,7 +548,7 @@ unsafe fn desktop_menu(hwnd: HWND, p: POINT) {
             crate::save();
         }
         // "新建" puts a new item on the desktop: drop it where the user clicked and rename it.
-        BgChoice::Shell => crate::expect_new_items(p, true),
+        BgChoice::Shell => crate::expect_new_items(None, p, true),
         _ => {}
     }
 }
