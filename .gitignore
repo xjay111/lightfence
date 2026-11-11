@@ -1,0 +1,5 @@
+# Build output
+/target
+
+# Local screenshots and frame dumps from development (may show personal desktop contents)
+/shots
